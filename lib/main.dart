@@ -29,7 +29,7 @@ class FlashDriveValidatorApp extends StatelessWidget {
   }
 }
 
-enum BlockStatus { untested, writing, written, verifying, good, warning, bad }
+enum BlockStatus { untested, writing, verifying, good, warning, bad }
 
 class ValidatorScreen extends StatefulWidget {
   const ValidatorScreen({super.key});
@@ -45,7 +45,7 @@ class _ValidatorScreenState extends State<ValidatorScreen> {
   bool isTesting = false;
   String? selectedPath;
 
-  int declaredGb = 32; // Выбранный пользователем объем по умолчанию
+  int declaredGb = 8; // Значение по умолчанию, пока не выбрана флешка
   
   double targetMb = 0.0;
   double writtenMb = 0.0;
@@ -60,6 +60,73 @@ class _ValidatorScreenState extends State<ValidatorScreen> {
       setState(() {
         selectedPath = path;
       });
+      // Как только выбрали путь - запускаем автоопределение размера
+      await _autoDetectSize(path);
+    }
+  }
+
+  // Округляет сырой размер в ГБ до стандартных значений флешек
+  int _roundToStandardGb(double rawGb) {
+    List<int> standards = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048];
+    int bestMatch = 8;
+    double minDiff = double.infinity;
+    for (int s in standards) {
+      double diff = (s - rawGb).abs();
+      if (diff < minDiff) {
+        minDiff = diff;
+        bestMatch = s;
+      }
+    }
+    return bestMatch;
+  }
+
+  // Спрашивает у системы Linux (Android) реальный заявленный объем диска
+  Future<void> _autoDetectSize(String path) async {
+    try {
+      final result = await Process.run('df', ['-k', path]);
+      final output = result.stdout.toString();
+      final lines = output.trim().split('\n');
+      
+      if (lines.length > 1) {
+        final parts = lines[1].trim().split(RegExp(r'\s+'));
+        // Ищем первый столбец, состоящий только из цифр (это блоки по 1 КБ)
+        for (int i = 1; i < parts.length; i++) {
+          if (RegExp(r'^\d+$').hasMatch(parts[i])) {
+            int kBlocks = int.parse(parts[i]);
+            // Производители флешек считают 1 ГБ = 1,000,000,000 байт
+            double rawGb = (kBlocks * 1024) / 1000000000;
+            int detected = _roundToStandardGb(rawGb);
+            
+            setState(() {
+              // Если определилось стандартное значение, обновляем дропдаун
+              if ([4, 8, 16, 32, 64, 128, 256, 512, 1024].contains(detected)) {
+                declaredGb = detected;
+              }
+            });
+            
+            if (mounted) {
+              ScaffoldMessenger.of(context).showSnackBar(
+                SnackBar(
+                  content: Text('Автоопределение: ${rawGb.toStringAsFixed(1)} ГБ\nУстановлен профиль: $declaredGb ГБ'),
+                  backgroundColor: Colors.green.shade800,
+                  duration: const Duration(seconds: 4),
+                )
+              );
+            }
+            break;
+          }
+        }
+      }
+    } catch (e) {
+      // Если системная команда не сработала, ничего не делаем - пользователь выберет сам
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('Не удалось автоопределить размер. Выберите вручную.'),
+            backgroundColor: Colors.redAccent,
+          )
+        );
+      }
     }
   }
 
@@ -70,14 +137,41 @@ class _ValidatorScreenState extends State<ValidatorScreen> {
     return '${mb.toStringAsFixed(0)} МБ';
   }
 
+  Future<bool> _verifyFile(File file, int expectedSize, Uint8List pattern, {bool quick = false}) async {
+    try {
+      if (!await file.exists()) return false;
+      var fileStream = file.openRead();
+      int bytesReadTotal = 0;
+      
+      await for (var chunk in fileStream) {
+        for (int j = 0; j < chunk.length; j += 4096) {
+          int expectedPatternIndex = (bytesReadTotal + j) % pattern.length;
+          if (chunk[j] != pattern[expectedPatternIndex]) return false;
+        }
+        bytesReadTotal += chunk.length;
+        if (quick) break; 
+      }
+      if (!quick && bytesReadTotal != expectedSize) return false;
+      return true;
+    } catch (e) {
+      return false;
+    }
+  }
+
+  Future<void> cleanupFiles() async {
+    for (int i = 0; i < totalBlocks; i++) {
+      try {
+        File f = File('$selectedPath/valitest_block_$i.bin');
+        if (await f.exists()) await f.delete();
+      } catch (_) {}
+    }
+  }
+
   Future<void> startTest() async {
     if (selectedPath == null && !mounted) return;
     
-    // Производители флешек считают 1 ГБ = 1,000,000,000 байт.
-    // Вычитаем 100 МБ (100 * 1024 * 1024) на файловую систему и погрешности.
     double rawBytes = (declaredGb * 1000.0 * 1000.0 * 1000.0) - (100.0 * 1024.0 * 1024.0);
-    if (rawBytes <= 0) rawBytes = 100 * 1024 * 1024; // Защита
-
+    if (rawBytes <= 0) rawBytes = 100 * 1024 * 1024;
     int blockSizeBytes = (rawBytes / totalBlocks).floor();
 
     setState(() {
@@ -89,130 +183,95 @@ class _ValidatorScreenState extends State<ValidatorScreen> {
       blocksDone = 0;
     });
 
-    // Генерируем 4 МБ тестовый паттерн для экономии ОЗУ телефона
     final int chunkSizeBytes = 4 * 1024 * 1024;
     final Uint8List chunkPattern = Uint8List(chunkSizeBytes);
     for (int i = 0; i < chunkSizeBytes; i++) {
       chunkPattern[i] = i % 256;
     }
 
-    // ФАЗА 1: ЗАПИСЬ
+    bool isFakeDetected = false;
+
     for (int i = 0; i < totalBlocks; i++) {
       if (!isTesting) break;
-      setState(() => blocks[i] = BlockStatus.writing);
 
-      File file = File('$selectedPath/valitest_block_$i.bin');
+      if (isFakeDetected) {
+        setState(() {
+          blocks[i] = BlockStatus.bad;
+          blocksDone++;
+        });
+        continue;
+      }
+
+      setState(() => blocks[i] = BlockStatus.writing);
+      File currentFile = File('$selectedPath/valitest_block_$i.bin');
+
+      bool writeSuccess = true;
       try {
-        var sink = file.openWrite();
+        var sink = currentFile.openWrite();
         int bytesWritten = 0;
-        
-        // Пишем файл кусками по 4 МБ, пока не заполним нужный объем кубика
         while (bytesWritten < blockSizeBytes) {
-          if (!isTesting) {
-            await sink.close();
-            break;
-          }
-          int toWrite = (blockSizeBytes - bytesWritten < chunkSizeBytes) 
-              ? blockSizeBytes - bytesWritten 
-              : chunkSizeBytes;
-              
+          if (!isTesting) { await sink.close(); break; }
+          int toWrite = (blockSizeBytes - bytesWritten < chunkSizeBytes) ? blockSizeBytes - bytesWritten : chunkSizeBytes;
           sink.add(Uint8List.view(chunkPattern.buffer, 0, toWrite));
           bytesWritten += toWrite;
         }
-        
         await sink.flush();
         await sink.close();
+      } catch (e) {
+        writeSuccess = false;
+      }
 
+      if (!writeSuccess) {
+        setState(() { blocks[i] = BlockStatus.bad; blocksDone++; });
+        continue;
+      }
+
+      setState(() {
+        writtenMb += (blockSizeBytes / (1024 * 1024));
+        blocks[i] = BlockStatus.verifying;
+      });
+
+      bool isGood = await _verifyFile(currentFile, blockSizeBytes, chunkPattern);
+
+      bool anchorIntact = true;
+      if (i > 0) {
+        File anchorFile = File('$selectedPath/valitest_block_0.bin');
+        anchorIntact = await _verifyFile(anchorFile, blockSizeBytes, chunkPattern, quick: true);
+      }
+
+      if (!anchorIntact) {
+        isFakeDetected = true;
         setState(() {
-          blocks[i] = BlockStatus.written;
-          writtenMb += (blockSizeBytes / (1024 * 1024));
+          blocks[i] = BlockStatus.bad;
+          blocksDone++;
         });
-      } catch (e) {
-        // Ошибка записи (вытащили флешку или кончилось реальное место)
-        setState(() => blocks[i] = BlockStatus.bad);
-      }
-    }
-
-    // ФАЗА 2: СВЕРКА
-    for (int i = 0; i < totalBlocks; i++) {
-      if (!isTesting) break;
-      if (blocks[i] == BlockStatus.bad) continue; 
-
-      setState(() => blocks[i] = BlockStatus.verifying);
-
-      File file = File('$selectedPath/valitest_block_$i.bin');
-      bool isGood = true;
-      bool isSlow = false;
-      Stopwatch stopwatch = Stopwatch()..start();
-
-      try {
-        if (await file.exists()) {
-          var fileStream = file.openRead();
-          int bytesReadTotal = 0;
-
-          await for (var chunk in fileStream) {
-            if (!isTesting) break;
-            
-            // Быстрая проверка каждого 4096-го байта, чтобы не вешать процессор
-            for (int j = 0; j < chunk.length; j += 4096) {
-              int expectedPatternIndex = (bytesReadTotal + j) % chunkSizeBytes;
-              if (chunk[j] != chunkPattern[expectedPatternIndex]) {
-                isGood = false;
-                break;
-              }
-            }
-            bytesReadTotal += chunk.length;
-            if (!isGood) break;
-          }
-
-          if (bytesReadTotal != blockSizeBytes) {
-            isGood = false;
-          }
-        } else {
-          isGood = false;
-        }
-      } catch (e) {
-        isGood = false;
-      }
-      
-      stopwatch.stop();
-      // Если файл читался дольше 3 секунд — блок медленный
-      if (stopwatch.elapsedMilliseconds > 3000) {
-        isSlow = true; 
+        continue; 
       }
 
       setState(() {
         if (isGood) {
           realMb += (blockSizeBytes / (1024 * 1024));
-          blocks[i] = isSlow ? BlockStatus.warning : BlockStatus.good;
+          blocks[i] = BlockStatus.good;
         } else {
           blocks[i] = BlockStatus.bad;
         }
         blocksDone++;
       });
-
-      // Зачищаем файл за собой
-      try {
-        if (await file.exists()) await file.delete();
-      } catch (_) {}
     }
 
-    setState(() {
-      isTesting = false;
-    });
+    await cleanupFiles();
+    setState(() => isTesting = false);
   }
 
-  void stopTest() {
-    setState(() {
-      isTesting = false;
-    });
+  void stopTest() async {
+    setState(() => isTesting = false);
+    await cleanupFiles();
   }
 
   Color getBlockColor(BlockStatus status) {
     switch (status) {
       case BlockStatus.untested: return Colors.grey.shade800;
       case BlockStatus.writing: return Colors.blueAccent;
-      case BlockStatus.written: return Colors.blueGrey;
       case BlockStatus.verifying: return Colors.yellowAccent;
       case BlockStatus.good: return Colors.green.shade600;
       case BlockStatus.warning: return Colors.orangeAccent;
@@ -251,7 +310,6 @@ class _ValidatorScreenState extends State<ValidatorScreen> {
                   ),
                 ),
                 const SizedBox(width: 8),
-                // Выпадающий список выбора объема
                 Container(
                   padding: const EdgeInsets.symmetric(horizontal: 12),
                   decoration: BoxDecoration(
@@ -264,7 +322,7 @@ class _ValidatorScreenState extends State<ValidatorScreen> {
                       dropdownColor: Colors.grey.shade900,
                       icon: const Icon(Icons.arrow_drop_down, color: Colors.white),
                       style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold),
-                      items: [4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048]
+                      items: [4, 8, 16, 32, 64, 128, 256, 512, 1024]
                           .map((e) => DropdownMenuItem(value: e, child: Text('$e ГБ')))
                           .toList(),
                       onChanged: isTesting ? null : (val) {
@@ -278,7 +336,7 @@ class _ValidatorScreenState extends State<ValidatorScreen> {
                   child: ElevatedButton.icon(
                     icon: Icon(isTesting ? Icons.stop : Icons.play_arrow, color: Colors.white),
                     label: Text(
-                      isTesting ? 'Остановить' : 'Старт',
+                      isTesting ? 'Остановка' : 'Старт',
                       style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 13),
                     ),
                     style: ElevatedButton.styleFrom(
@@ -307,10 +365,8 @@ class _ValidatorScreenState extends State<ValidatorScreen> {
               alignment: WrapAlignment.center,
               children: [
                 _buildLegendItem(Colors.green.shade600, 'Рабочий'),
-                _buildLegendItem(Colors.redAccent, 'Битый'),
-                _buildLegendItem(Colors.orangeAccent, 'Медленный'),
+                _buildLegendItem(Colors.redAccent, 'Битый/Фейк'),
                 _buildLegendItem(Colors.blueAccent, 'Пишем'),
-                _buildLegendItem(Colors.blueGrey, 'Записано'),
                 _buildLegendItem(Colors.yellowAccent, 'Сверка'),
               ],
             ),
@@ -336,7 +392,6 @@ class _ValidatorScreenState extends State<ValidatorScreen> {
               ),
             ),
             const SizedBox(height: 12),
-            // Панель статистики
             Container(
               padding: const EdgeInsets.all(12),
               decoration: BoxDecoration(
