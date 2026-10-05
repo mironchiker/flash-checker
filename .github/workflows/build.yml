@@ -35,8 +35,7 @@ jobs:
       - name: Add Storage Permissions and Fix SDK Version
         run: |
           sed -i '/<application/i \    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" />\n    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" />' flash_checker/android/app/src/main/AndroidManifest.xml
-          sed -i 's/compileSdk = flutter.compileSdkVersion/compileSdk = 36/g' flash_checker/android/app/build.gradle
-          sed -i 's/compileSdkVersion flutter.compileSdkVersion/compileSdkVersion 36/g' flash_checker/android/app/build.gradle
+          sed -i 's/compileSdk = flutter.compileSdkVersion/compileSdk = 36/g' flash_checker/android/app/build.gradle.kts
 
       - name: Build APK
         run: |
@@ -50,3 +49,4 @@ jobs:
           tag_name: v1.0.${{ github.run_number }}
           name: Release v1.0.${{ github.run_number }}
           files: flash_checker/build/app/outputs/flutter-apk/app-release.apk
+ 
