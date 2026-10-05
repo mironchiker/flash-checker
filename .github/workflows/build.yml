@@ -39,7 +39,7 @@ jobs:
       - name: Build APK
         run: |
           cd flash_checker
-          flutter pub add file_picker
+          flutter pub add "file_picker:^8.0.0"
           flutter build apk --release
 
       - name: Release
