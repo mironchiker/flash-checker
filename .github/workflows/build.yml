@@ -32,15 +32,18 @@ jobs:
       - name: Inject User Code
         run: cp lib/main.dart flash_checker/lib/main.dart
 
-      - name: Add Storage Permissions and Fix SDK Version
+      - name: Add Storage Permissions
         run: |
           sed -i '/<application/i \    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" />\n    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" />' flash_checker/android/app/src/main/AndroidManifest.xml
-          sed -i 's/compileSdk = flutter.compileSdkVersion/compileSdk = 36/g' flash_checker/android/app/build.gradle.kts
 
       - name: Build APK
         run: |
           cd flash_checker
           flutter pub add "file_picker:^8.0.0"
+          echo "" >> pubspec.yaml
+          echo "dependency_overrides:" >> pubspec.yaml
+          echo "  flutter_plugin_android_lifecycle: 2.0.22" >> pubspec.yaml
+          flutter pub get
           flutter build apk --release
 
       - name: Release
@@ -49,4 +52,3 @@ jobs:
           tag_name: v1.0.${{ github.run_number }}
           name: Release v1.0.${{ github.run_number }}
           files: flash_checker/build/app/outputs/flutter-apk/app-release.apk
- 
