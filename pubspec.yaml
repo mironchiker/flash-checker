@@ -1,0 +1,4 @@
+dependencies:
+  flutter:
+    sdk: flutter
+  file_picker: ^8.0.0
